@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 
 def show_heatmap(N, itos):
-    """Display the character transition matrix as a heatmap with labels"""
+    """Display the character transition count matrix as a heatmap with labels."""
     plt.figure(figsize=(16,16))
     plt.imshow(N, cmap="Blues")  # Show matrix as blue heatmap
     
@@ -18,42 +18,42 @@ def show_heatmap(N, itos):
 
 
 def main():
-    # Load all names from the text file
+    # 1) Load dataset (one name per line)
     with open("names.txt", "r") as file:
         names = file.read().splitlines()
 
-    # Create a 27x27 matrix to count character transitions (26 letters + '.' for start/end)
+    # 2) Prepare count matrix N for transitions (27 tokens: '.' + 26 letters)
     N = torch.zeros((27,27), dtype=torch.int32)
 
-    # Build character vocabulary: get all unique characters from names
+    # 3) Build vocabulary and index mappings
     chars = sorted(list(set(''.join(names))))
     chars = ['.'] + chars  # Add '.' at the beginning for start/end tokens
     stoi = {s:i for i,s in enumerate(chars)}  # String to index mapping
     itos = {i:s for i,s in enumerate(chars)}  # Index to string mapping
 
-    # Count character transitions: for each name, count how often each character follows another
+    # 4) Count character transitions into N
     for name in names:
         chars = ['.'] + list(name) + ['.']  # Add start/end tokens around each name
         for ch1, ch2 in zip(chars, chars[1:]):  # Look at each pair of consecutive characters
             N[stoi[ch1], stoi[ch2]] += 1  # Increment count for this transition
 
-    # Visualize the transition matrix
+    # Optional: visualize the transition matrix
     # show_heatmap(N, itos)
 
-    # Set random seed for reproducible name generation
+    # 5) Fix random seed for reproducibility
     g = torch.Generator().manual_seed(2147483647)
     
-    # Convert counts to probabilities: normalize each row to sum to 1
-    P = (N+1).float()  # Convert to float for division
-    P /= P.sum(1, keepdim=True)  # Each row now sums to 1 (probability distribution)
+    # 6) Convert counts to probabilities (Laplace smoothing by +1 to avoid zeros)
+    P = (N+1).float()
+    P /= P.sum(1, keepdim=True)  # Row-normalize so each row sums to 1
     
 
-    # Generate 20 new names using the learned character transition probabilities
+    # 7) Sample names using the bigram model
     for i in range(20):
         ix = 0  # Start with '.' (index 0)
         out = []  # Store generated characters
 
-        # Generate characters one by one until we hit the end token
+        # Generate characters until end token '.' (index 0) is sampled
         while True:
             p = P[ix]  # Get probability distribution for current character
             # Sample next character based on probabilities
@@ -64,7 +64,7 @@ def main():
         print(''.join(out))  # Print the complete generated name
 
 
-# ------------------------------------------------------------
+    # 8) Compute simple log-likelihood diagnostics on a few names
     log_likelihood = 0.0
     n = 0
     for name in names[:3]:
@@ -83,7 +83,7 @@ def main():
     print(f"Negative log likelihood: {nll}")
     print(f"Average Negative log likelihood: {nll/n}")
 
-    # --------------------------------------------
+    # 9) Build a small (x,y) dataset of next-character indices for the first 3 names
 
     xs, ys = [], []
 
