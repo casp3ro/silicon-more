@@ -44,7 +44,7 @@ def main():
     g = torch.Generator().manual_seed(2147483647)
     
     # Convert counts to probabilities: normalize each row to sum to 1
-    P = N.float()  # Convert to float for division
+    P = (N+1).float()  # Convert to float for division
     P /= P.sum(1, keepdim=True)  # Each row now sums to 1 (probability distribution)
     
 
@@ -62,6 +62,45 @@ def main():
             if ix == 0:  # If we sampled '.' (end token), stop generating
                 break
         print(''.join(out))  # Print the complete generated name
+
+
+# ------------------------------------------------------------
+    log_likelihood = 0.0
+    n = 0
+    for name in names[:3]:
+        chars = ['.'] + list(name) + ['.']  
+        for ch1, ch2 in zip(chars, chars[1:]): 
+            ix = stoi[ch1]
+            ix2 = stoi[ch2]
+            prob = P[ix, ix2]
+            logprob = torch.log(prob)
+            log_likelihood += logprob
+            n+=1
+            print(f" {ch1} -> {ch2} : {logprob}")
+    
+    print(f"Log likelihood: {log_likelihood}")
+    nll = -log_likelihood
+    print(f"Negative log likelihood: {nll}")
+    print(f"Average Negative log likelihood: {nll/n}")
+
+    # --------------------------------------------
+
+    xs, ys = [], []
+
+    for name in names[:3]:
+        chars = ['.'] + list(name) + ['.']  
+        for ch1, ch2 in zip(chars, chars[1:]): 
+            ix = stoi[ch1]
+            ix2 = stoi[ch2]
+            print(f" {ch1} -> {ch2} : {ix} {ix2}")
+            xs.append(ix)
+            ys.append(ix2)
+    
+    xs = torch.tensor(xs)
+    ys = torch.tensor(ys)
+    print(xs.shape, ys.shape)
+
+
 
 
 if __name__ == "__main__":
