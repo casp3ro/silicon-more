@@ -1,149 +1,183 @@
 import torch
-import matplotlib.pyplot as plt
-import torch.nn.functional as F  # tensor ops; we'll use one-hot and simple softmax-like normalization
 import torch.nn.functional as F
 
 
-def show_heatmap(N, itos):
-    """Display the character transition count matrix as a heatmap with labels."""
-    plt.figure(figsize=(16,16))
-    plt.imshow(N, cmap="Blues")  # Show matrix as blue heatmap
+class SimpleBigramModel:
+    """
+    A tiny "next-token" predictor built from a list of words.
+
+    Plain English summary:
+    - We look at pairs of neighboring characters inside words.
+    - We learn a simple table of numbers that says: "if the current
+      character is X, how likely is the next character Y?" (works for
+      any list of words, not just names)
+    - With that table, we can estimate how well the model fits the data.
     
-    # Add character pair labels and counts to each cell
-    for i in range(27):
-        for j in range(27):
-            chstr = itos[i] + itos[j]  # Character pair (e.g., "ab", ".e")
-            plt.text(j, i, chstr, ha="center", va="bottom", color="gray")  # Character pair at bottom
-            plt.text(j, i, str(N[i,j].item()), ha="center", va="top", color="gray")  # Count at top
-    plt.axis("off")
-    plt.show()
+    This is NOT a complex AI system. It's just basic counting turned
+    into a small math formula so we can train it automatically.
+    """
+
+    def __init__(self, dataset_path: str = "names.txt", seed: int = 2147483647) -> None:
+        # Where we read the training data from (one word per line)
+        # Default points to "names.txt" to stay compatible with your current file.
+        self.dataset_path = dataset_path
+        # Fix the random seed so results are the same each run
+        self.rng = torch.Generator().manual_seed(seed)
+
+        # These will be filled after loading and preparing data
+        self.chars = None          # list of all characters we use, incl. '.'
+        self.stoi = None           # maps character -> index
+        self.itos = None           # maps index -> character
+        self.xs = None             # tensor of current-character indices
+        self.ys = None             # tensor of next-character indices
+        self.W = None              # the learnable weight table (our simple model)
+
+    def load_words(self) -> list:
+        """Read words from the file. Each line is one word."""
+        with open(self.dataset_path, "r") as file:
+            words = file.read().splitlines()
+        return words
+
+    def build_vocabulary(self, words: list) -> None:
+        """Create the list of characters and the two helper look-up tables."""
+        # We collect the set of all characters appearing in the words
+        unique_chars = sorted(list(set(''.join(words))))
+        # We also add '.' which we use to mark the start and end of a name
+        self.chars = ['.'] + unique_chars
+        self.stoi = {ch: idx for idx, ch in enumerate(self.chars)}
+        self.itos = {idx: ch for idx, ch in enumerate(self.chars)}
+
+    def build_training_pairs(self, words: list) -> None:
+        """
+        Turn words into many small training examples.
+
+        For each word, we add a start marker '.' at the beginning and an
+        end marker '.' at the end. Then we look at every adjacent pair
+        of characters (current, next) and store them as numbers.
+        """
+        xs, ys = [], []
+        for word in words:
+            padded = ['.'] + list(word) + ['.']
+            for ch_now, ch_next in zip(padded, padded[1:]):
+                xs.append(self.stoi[ch_now])
+                ys.append(self.stoi[ch_next])
+
+        self.xs = torch.tensor(xs)
+        self.ys = torch.tensor(ys)
+
+    def initialize_model(self) -> None:
+        """Start with random numbers for our table of next-letter scores."""
+        vocab_size = len(self.chars)
+        # W is a square table: rows = current letter, columns = next letter
+        # requires_grad=True means PyTorch will help us improve W automatically
+        self.W = torch.randn((vocab_size, vocab_size), generator=self.rng, requires_grad=True)
+
+    def compute_loss(self) -> torch.Tensor:
+        """
+        Calculate how wrong the model is on average (lower is better).
+
+        Steps in simple terms:
+        - We convert each current-letter index into a row of zeros with a single 1
+          (this is called one-hot; it just picks a row from the table).
+        - We use the table W to produce a score for each possible next letter.
+        - We make the scores positive and normalize them to behave like probabilities.
+        - We look up the probability of the real next letter and take the negative log.
+        - We average this number across all training pairs. This is our loss.
+        """
+        # 1) Get how many distinct characters we have (including '.')
+        vocab_size = len(self.chars)
+
+        # 2) Turn indices into simple selector rows (one-hot): picks a single row of W
+        xenc = F.one_hot(self.xs, num_classes=vocab_size).float()
+
+        # 3) Multiply selectors by W to get a score for every possible next character
+        logits = xenc @ self.W
+
+        # 4) Make scores positive so they behave like unnormalized probabilities
+        counts = logits.exp()
+
+        # 5) Normalize each row so it sums to 1 (now each row is a proper probability list)
+        probs = counts / counts.sum(1, keepdim=True)
+
+        # 6) Pick the probability of the real next character for every example,
+        #    take a log (so confident wrong answers are punished), and average negative
+        loss = -probs[torch.arange(self.xs.size(0)), self.ys].log().mean()
+        return loss
+
+    def train(self, steps: int = 30, learning_rate: float = 70.0) -> None:
+        """Improve W a little bit for a fixed number of steps."""
+        for _ in range(steps):
+            # a) Measure how wrong we are right now
+            loss = self.compute_loss()
+            # b) Print current loss so you can see it decrease over time
+            print(loss.item())
+
+            # c) Ask PyTorch to compute how to change W to reduce the loss
+            self.W.grad = None
+            loss.backward()
+
+            # d) Move W a small step in the better direction
+            self.W.data += -learning_rate * self.W.grad
+
+    def fit(self, steps: int = 30, learning_rate: float = 70.0) -> None:
+        """Convenience method: run the whole setup and training."""
+        # 1) Read words (one per line) from the dataset file
+        words = self.load_words()
+        # 2) Build the list of characters and index lookups
+        self.build_vocabulary(words)
+        # 3) Convert words into many (current_char, next_char) pairs
+        self.build_training_pairs(words)
+        # 4) Start with a random table of scores
+        self.initialize_model()
+        # 5) Improve the table by a few training steps
+        self.train(steps=steps, learning_rate=learning_rate)
+
+    def sample(self, num_examples: int = 10) -> list:
+        """
+        Make a few example words from the current model.
+
+        How it works in plain English:
+        - We start from the special start marker '.'
+        - We look up the row of probabilities for the next character
+        - We pick the next character at random, following those probabilities
+        - We repeat until we pick '.' again, which means "end"
+        - We join the picked characters to form one word
+        """
+        if self.W is None or self.chars is None or self.stoi is None or self.itos is None:
+            raise RuntimeError("Model is not ready. Run fit() first or set up vocabulary/weights.")
+
+        # Convert the learned scores into probabilities for easy sampling
+        counts = self.W.exp()  # make scores positive
+        P = counts / counts.sum(1, keepdim=True)  # normalize rows to sum to 1
+
+        start_index = self.stoi['.']
+        generated = []
+        for _ in range(num_examples):
+            ix = start_index
+            out_chars = []
+            while True:
+                # Take the probability row for the current character
+                p = P[ix]
+                # Randomly pick the next character index according to p
+                ix = torch.multinomial(p, num_samples=1, replacement=True, generator=self.rng).item()
+                # If we reached the end marker, stop and save the word
+                if ix == start_index:
+                    break
+                # Otherwise collect the character and continue
+                out_chars.append(self.itos[ix])
+            generated.append(''.join(out_chars))
+
+        return generated
 
 
-def main():
-    # 1) Load dataset (one name per line)
-    with open("names.txt", "r") as file:
-        names = file.read().splitlines()
-
-    # 2) Prepare count matrix N for transitions (27 tokens: '.' + 26 letters)
-    N = torch.zeros((27,27), dtype=torch.int32)
-
-    # 3) Build vocabulary and index mappings
-    chars = sorted(list(set(''.join(names))))
-    chars = ['.'] + chars  # Add '.' at the beginning for start/end tokens
-    stoi = {s:i for i,s in enumerate(chars)}  # String to index mapping
-    itos = {i:s for i,s in enumerate(chars)}  # Index to string mapping
-
-    # # 4) Count character transitions into N
-    # for name in names:
-    #     chars = ['.'] + list(name) + ['.']  # Add start/end tokens around each name
-    #     for ch1, ch2 in zip(chars, chars[1:]):  # Look at each pair of consecutive characters
-    #         N[stoi[ch1], stoi[ch2]] += 1  # Increment count for this transition
-
-    # # Optional: visualize the transition matrix
-    # # show_heatmap(N, itos)
-
-    # # 5) Fix random seed for reproducibility
-    # g = torch.Generator().manual_seed(2147483647)
-    
-    # # 6) Convert counts to probabilities (Laplace smoothing by +1 to avoid zeros)
-    # P = (N+1).float()
-    # P /= P.sum(1, keepdim=True)  # Row-normalize so each row sums to 1
-    
-
-    # # 7) Sample names using the bigram model
-    # for i in range(20):
-    #     ix = 0  # Start with '.' (index 0)
-    #     out = []  # Store generated characters
-
-    #     # Generate characters until end token '.' (index 0) is sampled
-    #     while True:
-    #         p = P[ix]  # Get probability distribution for current character
-    #         # Sample next character based on probabilities
-    #         ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
-    #         out.append(itos[ix])  # Add the sampled character to output
-    #         if ix == 0:  # If we sampled '.' (end token), stop generating
-    #             break
-    #     print(''.join(out))  # Print the complete generated name
-
-
-    # # 8) Compute simple log-likelihood diagnostics on a few names
-    # log_likelihood = 0.0
-    # n = 0
-    # for name in names[:3]:
-    #     chars = ['.'] + list(name) + ['.']  
-    #     for ch1, ch2 in zip(chars, chars[1:]): 
-    #         ix = stoi[ch1]
-    #         ix2 = stoi[ch2]
-    #         prob = P[ix, ix2]
-    #         logprob = torch.log(prob)
-    #         log_likelihood += logprob
-    #         n+=1
-    #         print(f" {ch1} -> {ch2} : {logprob}")
-    
-    # print(f"Log likelihood: {log_likelihood}")
-    # nll = -log_likelihood
-    # print(f"Negative log likelihood: {nll}")
-    # print(f"Average Negative log likelihood: {nll/n}")
-
-    # 9) Build a small (x,y) dataset of next-character indices for the first 3 names
-    #    xs holds current-character indices, ys holds the next-character indices.
-
-    xs, ys = [], []
-
-    for name in names[:3]:
-        chars = ['.'] + list(name) + ['.']  
-        for ch1, ch2 in zip(chars, chars[1:]): 
-            ix = stoi[ch1]
-            ix2 = stoi[ch2]
-            print(f" {ch1} -> {ch2} : {ix} {ix2}")
-            xs.append(ix)
-            ys.append(ix2)
-    
-    xs = torch.tensor(xs)
-    ys = torch.tensor(ys)
-    # xs: tensor of current-character indices; ys: tensor of next-character indices
-    # Both have length equal to the number of adjacent character pairs extracted above
-    print(xs)
-    print(ys)
-
-    # plt.imshow(xenc)
-    # plt.show()
-    # print(xenc.shape)
-    
-    # 10) Tiny linear bigram model (no training):
-    #     - One-hot encode inputs
-    #     - Apply linear layer W to get logits (unnormalized scores)
-    #     - Exponentiate to get positive counts
-    #     - Normalize rows to get probabilities (softmax without calling softmax)
-    g = torch.Generator().manual_seed(2147483647 +1)
-    # W: linear layer weights mapping current-char (27-dim one-hot) -> next-char scores (27-dim)
-    W = torch.randn((27,27), generator=g)
-    # One-hot encode inputs so each row is a 27-dim indicator for the current char
-    xenc = F.one_hot(xs, num_classes=27).float()  # shape: [num_pairs, 27]
-    # Linear scores (logits) for each possible next character
-    logits = xenc @ W  # shape: [num_pairs, 27]
-    # Convert scores to positive values; this is like unnormalized probabilities
-    counts = logits.exp()
-    # Normalize each row to sum to 1 to obtain a probability distribution (softmax-like)
-    probs = counts / counts.sum(1, keepdim=True)
-    # Negative log-likelihood (cross-entropy without reduction helpers):
-    # pick the probability of the true next char for each row, take log, average negative
-    loss = -probs[torch.arange(xs.size(0)), ys].log().mean()
-    print(loss)
-
-    # print(probs)  # per-example distributions over next character
-
-    # nlls = torch.zeros(5)
-
-    # for i in range(5):
-    #     x = xs[i].item()
-    #     y = ys[i].item()
-    #     p = probs[i,y]
-    #     logp = torch.log(p)
-    #     nll =-logp
-    #     nlls[i] = nll
-    
-    # print(nlls.mean().item())
+def main() -> None:
+    # Create the model and train it. Defaults are kept simple on purpose.
+    # You can pass a different file via dataset_path (one word per line).
+    model = SimpleBigramModel(dataset_path="names.txt", seed=2147483647 +2)
+    model.fit(steps=100, learning_rate=50.0)
+    # After training, print a few made-up examples
+    for w in model.sample(num_examples=10):
+        print(w)
 
 
 if __name__ == "__main__":
