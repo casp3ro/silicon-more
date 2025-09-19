@@ -1,5 +1,9 @@
+import logging
 import torch
 import torch.nn.functional as F
+
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
 class SimpleBigramModel:
@@ -15,6 +19,13 @@ class SimpleBigramModel:
     
     This is NOT a complex AI system. It's just basic counting turned
     into a small math formula so we can train it automatically.
+
+    Key tensors and what they mean:
+    - xs: indices for the current character of each bigram example.
+    - ys: indices for the next character of each bigram example.
+    - W:  a learnable table where row=current char, column=next char.
+          Higher numbers in W[row, col] mean the model prefers that
+          transition.
     """
 
     def __init__(self, dataset_path: str = "names.txt", seed: int = 2147483647) -> None:
@@ -54,6 +65,10 @@ class SimpleBigramModel:
         For each word, we add a start marker '.' at the beginning and an
         end marker '.' at the end. Then we look at every adjacent pair
         of characters (current, next) and store them as numbers.
+        Example for "anna":
+          padded sequence: . a n n a .
+          bigrams: (.,a), (a,n), (n,n), (n,a), (a,.)
+          xs holds the left char indices, ys holds the right char indices.
         """
         xs, ys = [], []
         for word in words:
@@ -83,6 +98,11 @@ class SimpleBigramModel:
         - We make the scores positive and normalize them to behave like probabilities.
         - We look up the probability of the real next letter and take the negative log.
         - We average this number across all training pairs. This is our loss.
+
+        Shapes to keep in mind:
+        - xenc: [num_pairs, vocab_size]
+        - logits/counts/probs: [num_pairs, vocab_size]
+        - ys: [num_pairs]
         """
         # 1) Get how many distinct characters we have (including '.')
         vocab_size = len(self.chars)
@@ -106,30 +126,31 @@ class SimpleBigramModel:
 
     def train(self, steps: int = 30, learning_rate: float = 70.0) -> None:
         """Improve W a little bit for a fixed number of steps."""
-        for _ in range(steps):
-            # a) Measure how wrong we are right now
+        logging.info("Starting training: steps=%d, learning_rate=%.3f", steps, learning_rate)
+        for step_index in range(steps):
             loss = self.compute_loss()
-            # b) Print current loss so you can see it decrease over time
-            print(loss.item())
+            if step_index % max(1, steps // 10) == 0 or step_index == steps - 1:
+                logging.info("Step %d/%d - loss: %.6f", step_index + 1, steps, loss.item())
 
-            # c) Ask PyTorch to compute how to change W to reduce the loss
             self.W.grad = None
             loss.backward()
 
-            # d) Move W a small step in the better direction
             self.W.data += -learning_rate * self.W.grad
+        logging.info("Finished training")
 
     def fit(self, steps: int = 30, learning_rate: float = 70.0) -> None:
-        """Convenience method: run the whole setup and training."""
-        # 1) Read words (one per line) from the dataset file
+        """Run the full data prep and training pipeline."""
+        logging.info("Loading dataset from %s", self.dataset_path)
         words = self.load_words()
-        # 2) Build the list of characters and index lookups
+        logging.info("Loaded %d words", len(words))
+
         self.build_vocabulary(words)
-        # 3) Convert words into many (current_char, next_char) pairs
+        logging.info("Vocabulary size (incl. '.'): %d", len(self.chars))
+
         self.build_training_pairs(words)
-        # 4) Start with a random table of scores
+        logging.info("Prepared %d training bigrams", self.xs.size(0))
+
         self.initialize_model()
-        # 5) Improve the table by a few training steps
         self.train(steps=steps, learning_rate=learning_rate)
 
     def sample(self, num_examples: int = 10) -> list:
@@ -142,6 +163,11 @@ class SimpleBigramModel:
         - We pick the next character at random, following those probabilities
         - We repeat until we pick '.' again, which means "end"
         - We join the picked characters to form one word
+
+        Implementation detail:
+        - We exponentiate W and row-normalize it to form P, a matrix of
+          next-character probabilities. Then we do ancestral sampling
+          from this Markov chain until we hit the end token '.' again.
         """
         if self.W is None or self.chars is None or self.stoi is None or self.itos is None:
             raise RuntimeError("Model is not ready. Run fit() first or set up vocabulary/weights.")
@@ -171,13 +197,13 @@ class SimpleBigramModel:
 
 
 def main() -> None:
-    # Create the model and train it. Defaults are kept simple on purpose.
-    # You can pass a different file via dataset_path (one word per line).
-    model = SimpleBigramModel(dataset_path="names.txt", seed=2147483647 +2)
+    """Train the bigram model and print sample generations."""
+    model = SimpleBigramModel(dataset_path="names.txt", seed=2147483647 + 2)
     model.fit(steps=100, learning_rate=50.0)
-    # After training, print a few made-up examples
-    for w in model.sample(num_examples=10):
-        print(w)
+    samples = model.sample(num_examples=10)
+    logging.info("Sampled %d words:", len(samples))
+    for word in samples:
+        print(word)
 
 
 if __name__ == "__main__":
