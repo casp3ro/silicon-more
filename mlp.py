@@ -1,6 +1,33 @@
 import torch
 import torch.nn.functional as F  # tensor ops; we'll use one-hot and simple softmax-like normalization
 import random
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Constants
+# -----------------------------
+PY_RANDOM_SEED = 42
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.9
+
+START_END_TOKEN = '.'
+START_TOKEN_INDEX = 0
+
+TORCH_RANDOM_SEED = 2147483647
+
+EMBEDDING_DIM = 10
+CONTEXT_WINDOW = 3
+HIDDEN_SIZE = 200
+
+TRAIN_STEPS = 10000
+BATCH_SIZE = 32
+LEARNING_RATE = 0.06
+
+# For the optional one-hot demo
+SAMPLE_ONE_HOT_INDEX = 5
+
+# Derived dimensions
+FLATTENED_CONTEXT_DIM = CONTEXT_WINDOW * EMBEDDING_DIM
 
 def main() -> None:
     """Tiny, readable demo of how character embeddings work with context.
@@ -20,15 +47,15 @@ def main() -> None:
 
     # Build one vocabulary across the entire dataset so indices are consistent
     characters = sorted(list(set(''.join(words_dataset))))
-    characters = ['.'] + characters  # Add '.' at the beginning for start/end tokens
+    characters = [START_END_TOKEN] + characters  # Add start/end token at the beginning
     stoi = {symbol: idx for idx, symbol in enumerate(characters)}  # String -> index
     itos = {idx: symbol for idx, symbol in enumerate(characters)}  # Index -> string
 
-    def build_dataset(words: list, stoi_map: dict, context_window: int = 3):
+    def build_dataset(words: list, stoi_map: dict, context_window: int = CONTEXT_WINDOW):
         # Turn words into (context, next_char) training pairs using a fixed window
         inputs, targets = [], []
         for word in words:
-            context = [0] * context_window  # start with '.' tokens
+            context = [START_TOKEN_INDEX] * context_window  # start with '.' tokens
             for character in word + '.':
                 next_index = stoi_map[character]
                 inputs.append(context)
@@ -39,11 +66,11 @@ def main() -> None:
         return X, Y
 
 
-    random.seed(42)  # set Python's RNG so the shuffle order is reproducible
+    random.seed(PY_RANDOM_SEED)  # set Python's RNG so the shuffle order is reproducible
     random.shuffle(words_dataset)  # shuffle so splits are representative
 
-    n1 = int(0.8*len(words_dataset))
-    n2 = int(0.9*len(words_dataset))
+    n1 = int(TRAIN_RATIO * len(words_dataset))
+    n2 = int(VAL_RATIO * len(words_dataset))
 
     training_words = words_dataset[:n1]
     validation_words = words_dataset[n1:n2]
@@ -59,18 +86,18 @@ def main() -> None:
     # This ensures that every time we run the script, we get the same random weights
     # and can compare results across different runs. The seed value (2147483647) is
     # a large prime number that provides good randomness distribution.
-    random_generator = torch.Generator().manual_seed(2147483647)
+    random_generator = torch.Generator().manual_seed(TORCH_RANDOM_SEED)
 
     # print("Training tensor shapes -> X: %s, Y: %s" % (tuple(X.shape), tuple(Y.shape)))
 
     # Embedding table maps character indices -> 2D vectors (size = vocabulary size)
     # In a real model, these would be learned; here we initialize randomly.
     vocab_size = len(characters)
-    embedding_table = torch.randn((vocab_size, 2), generator=random_generator)
+    embedding_table = torch.randn((vocab_size, EMBEDDING_DIM), generator=random_generator)
 
     # A quick detour (optional): one-hot selecting a row from the embedding table.
     # Kept for reference; not printed to avoid noisy output.
-    _ = F.one_hot(torch.tensor(5), num_classes=27).float() @ embedding_table
+    _ = F.one_hot(torch.tensor(SAMPLE_ONE_HOT_INDEX), num_classes=vocab_size).float() @ embedding_table
 
 
 
@@ -81,19 +108,20 @@ def main() -> None:
     
     # First layer: transform from flattened context (6D) to hidden representation (100D)
     # We flatten the context because we have 3 characters × 2 embedding dimensions = 6 features
-    W1 = torch.randn((6, 100), generator=random_generator)  # Weight matrix: 6 inputs -> 100 hidden units
-    b1 = torch.randn(100, generator=random_generator)       # Bias vector for the hidden layer
+    W1 = torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator)
+    b1 = torch.randn(HIDDEN_SIZE, generator=random_generator)
     
 
     
     # Second layer: transform from hidden representation (100D) to output logits (vocab_size)
     # One output per character in the vocabulary
-    W2 = torch.randn((100, vocab_size), generator=random_generator)  # 100 hidden -> vocab_size outputs
-    b2 = torch.randn(vocab_size, generator=random_generator)         # Output layer bias
+    W2 = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator)
+    b2 = torch.randn(vocab_size, generator=random_generator)
     
 
     # Collect all trainable tensors. We will learn the embedding table and both layers.
     parameters = [embedding_table, W1, b1, W2, b2]
+    print(sum(p.nelement() for p in parameters))
 
     # Enable gradient tracking for manual optimization below
     for p in parameters:
@@ -101,9 +129,9 @@ def main() -> None:
 
     # Training loop: forward pass -> backward pass -> parameter update
 
-    for _ in range(1000):  # repeat many small learning steps
+    for _ in range(TRAIN_STEPS):  # repeat many small learning steps
         # Sample a minibatch of 32 random training examples
-        ix = torch.randint(0, X_training.shape[0], (32,))
+        ix = torch.randint(0, X_training.shape[0], (BATCH_SIZE,))
 
         # The idiomatic way: directly index into the embedding table with X.
         # This yields one 2D vector per character in the 3-long context window.
@@ -113,7 +141,7 @@ def main() -> None:
 
         # Apply the first linear transformation followed by tanh activation
         # Shape: [num_examples, 6] @ [6, 100] + [100] = [num_examples, 100]
-        hidden_activations = torch.tanh(context_embeddings.view(-1, 6) @ W1 + b1)
+        hidden_activations = torch.tanh(context_embeddings.view(-1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
 
 
         # Compute the final logits (unnormalized scores for each character)
@@ -131,7 +159,7 @@ def main() -> None:
 
         # Parameter update (simple SGD) with a fixed learning rate
         # Note: we update in-place without an optimizer for clarity
-        learning_rate = 0.01
+        learning_rate = LEARNING_RATE
         for p in parameters:
             p.data += -learning_rate * p.grad
     
@@ -139,12 +167,12 @@ def main() -> None:
     # Validation: run a forward pass on the validation split to estimate generalization
 
     context_embeddings = embedding_table[X_validation]
-    hidden_activations = torch.tanh(context_embeddings.view(-1, 6) @ W1 + b1)
+    hidden_activations = torch.tanh(context_embeddings.view(-1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
     logits = hidden_activations @ W2 + b2
     loss = F.cross_entropy(logits, Y_validation)
 
     print(loss.item())  # lower is better; use this to compare different runs/settings
-    
+
 
 
 if __name__ == "__main__":
