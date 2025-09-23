@@ -19,9 +19,9 @@ EMBEDDING_DIM = 10
 CONTEXT_WINDOW = 3
 HIDDEN_SIZE = 200
 
-TRAIN_STEPS = 10000
+TRAIN_STEPS = 15000
 BATCH_SIZE = 32
-LEARNING_RATE = 0.06
+LEARNING_RATE = 0.04
 
 # For the optional one-hot demo
 SAMPLE_ONE_HOT_INDEX = 5
@@ -42,6 +42,7 @@ def main() -> None:
        a numeric representation (vectors) for each character in the context.
         4) Print a few key shapes so it's easy to verify what's happening.
     """
+    # Load the raw dataset (one name per line)
     with open("names.txt", "r") as file:
         words_dataset = file.read().splitlines()
 
@@ -52,6 +53,17 @@ def main() -> None:
     itos = {idx: symbol for idx, symbol in enumerate(characters)}  # Index -> string
 
     def build_dataset(words: list, stoi_map: dict, context_window: int = CONTEXT_WINDOW):
+        """Turn words into (context, next_char) pairs using a fixed sliding window.
+
+        Args:
+            words: List of strings used to produce training samples.
+            stoi_map: Mapping from character to integer index.
+            context_window: Number of previous characters to condition on.
+
+        Returns:
+            X: Tensor of shape [num_samples, context_window] with character indices.
+            Y: Tensor of shape [num_samples] with the next-character index.
+        """
         # Turn words into (context, next_char) training pairs using a fixed window
         inputs, targets = [], []
         for word in words:
@@ -61,14 +73,15 @@ def main() -> None:
                 inputs.append(context)
                 targets.append(next_index)
                 context = context[1:] + [next_index]
-        X = torch.tensor(inputs)
-        Y = torch.tensor(targets)
+        X = torch.tensor(inputs)  # [N, context_window]
+        Y = torch.tensor(targets) # [N]
         return X, Y
 
 
     random.seed(PY_RANDOM_SEED)  # set Python's RNG so the shuffle order is reproducible
     random.shuffle(words_dataset)  # shuffle so splits are representative
 
+    # Compute split indices for train/val/test partitions
     n1 = int(TRAIN_RATIO * len(words_dataset))
     n2 = int(VAL_RATIO * len(words_dataset))
 
@@ -121,11 +134,12 @@ def main() -> None:
 
     # Collect all trainable tensors. We will learn the embedding table and both layers.
     parameters = [embedding_table, W1, b1, W2, b2]
+    # Print total number of trainable parameters for quick sanity check
     print(sum(p.nelement() for p in parameters))
 
     # Enable gradient tracking for manual optimization below
     for p in parameters:
-        p.requires_grad = True
+        p.requires_grad = True  # enable autograd tracking
 
     # Training loop: forward pass -> backward pass -> parameter update
 
@@ -153,7 +167,7 @@ def main() -> None:
 
         #BACKWARD PASS
         for p in parameters:
-            p.grad = None
+            p.grad = None  # zero gradients from previous step
 
         loss.backward()
 
@@ -172,6 +186,26 @@ def main() -> None:
     loss = F.cross_entropy(logits, Y_validation)
 
     print(loss.item())  # lower is better; use this to compare different runs/settings
+
+
+    # Generate a few names
+    for _ in range(10):
+            context = [START_TOKEN_INDEX] * CONTEXT_WINDOW
+            generated_indices = []
+            while True:
+                context_embeddings = embedding_table[torch.tensor(context)]  # [CONTEXT_WINDOW, EMBEDDING_DIM]
+                hidden_activations = torch.tanh(context_embeddings.view(1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
+                logits = hidden_activations @ W2 + b2  # [1, vocab_size]
+                probs = F.softmax(logits, dim=1)  # convert logits to probabilities
+                ix = torch.multinomial(probs, num_samples=1, generator=random_generator).item()  # sample next char index
+                if ix == START_TOKEN_INDEX:
+                    break
+                generated_indices.append(ix)
+                context = context[1:] + [ix]  # slide window to include the new index
+
+            print(''.join(itos[i] for i in generated_indices))
+
+
 
 
 
