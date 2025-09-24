@@ -19,7 +19,7 @@ EMBEDDING_DIM = 10
 CONTEXT_WINDOW = 3
 HIDDEN_SIZE = 200
 
-TRAIN_STEPS = 15000
+TRAIN_STEPS = 20000
 BATCH_SIZE = 32
 LEARNING_RATE = 0.04
 
@@ -121,15 +121,26 @@ def main() -> None:
     
     # First layer: transform from flattened context (6D) to hidden representation (100D)
     # We flatten the context because we have 3 characters × 2 embedding dimensions = 6 features
-    W1 = torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator)
-    b1 = torch.randn(HIDDEN_SIZE, generator=random_generator)
+    #
+    # Why scale the initialization down?
+    # - Keeps tanh in its high-slope (near-linear) region at the start, preventing saturation
+    #   which would otherwise yield tiny gradients and slow/unstable training.
+    # - Produces smaller pre-activations and logits overall, avoiding extreme softmax probabilities
+    #   that can spike loss or make gradients noisy early on.
+    # - Acts like a simplified Xavier/He-style effect: variance of activations stays moderate across layers.
+    W1 = torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator) * 0.2  # small weights → stable activations/gradients
+    b1 = torch.randn(HIDDEN_SIZE, generator=random_generator) * 0.01  # near-zero bias so features, not offsets, drive learning
     
 
     
     # Second layer: transform from hidden representation (100D) to output logits (vocab_size)
     # One output per character in the vocabulary
-    W2 = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator)
-    b2 = torch.randn(vocab_size, generator=random_generator)
+    #
+    # Small output weights/biases help start the model "uncertain": logits near zero
+    # produce near-uniform softmax, which yields healthier, less peaky gradients for cross-entropy.
+    # If logits are too large initially, the model can be overconfident and harder to optimize.
+    W2 = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator) * 0.01  # small weights → modest logits, better early gradients
+    b2 = torch.randn(vocab_size, generator=random_generator) * 0  # zero bias keeps initial class preferences neutral
     
 
     # Collect all trainable tensors. We will learn the embedding table and both layers.
