@@ -119,32 +119,78 @@ def main() -> None:
     # The network takes the embedded context and learns to output probabilities
     # for each possible next character.
     
-    # First layer: transform from flattened context (6D) to hidden representation (100D)
-    # We flatten the context because we have 3 characters × 2 embedding dimensions = 6 features
-    #
-    # Why scale the initialization down?
-    # - Keeps tanh in its high-slope (near-linear) region at the start, preventing saturation
-    #   which would otherwise yield tiny gradients and slow/unstable training.
-    # - Produces smaller pre-activations and logits overall, avoiding extreme softmax probabilities
-    #   that can spike loss or make gradients noisy early on.
-    # - Acts like a simplified Xavier/He-style effect: variance of activations stays moderate across layers.
-    W1 = torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator) * 0.2  # small weights → stable activations/gradients
-    b1 = torch.randn(HIDDEN_SIZE, generator=random_generator) * 0.01  # near-zero bias so features, not offsets, drive learning
+    def standardize_train(x: torch.Tensor, gain: torch.Tensor, bias: torch.Tensor,
+                          running_mean: torch.Tensor, running_std: torch.Tensor,
+                          momentum: float = 0.1) -> torch.Tensor:
+        """Batch standardization for training; updates running stats in-place.
+
+        x: [batch, features]; running_mean/std: [1, features].
+        """
+        batch_mean = x.mean(0, keepdim=True)
+        batch_std = x.std(0, keepdim=True, unbiased=False) 
+        # Update running stats in-place for use at eval/generation time
+        running_mean.mul_(1.0 - momentum).add_(momentum * batch_mean)
+        running_std.mul_(1.0 - momentum).add_(momentum * batch_std)
+        return gain * (x - batch_mean) / batch_std + bias
+
+    def standardize_eval(x: torch.Tensor, gain: torch.Tensor, bias: torch.Tensor,
+                         running_mean: torch.Tensor, running_std: torch.Tensor) -> torch.Tensor:
+        """Standardization for eval/generation using running statistics."""
+        return gain * (x - running_mean) / running_std + bias
+
+    def compute_hidden_activations(context_embeddings: torch.Tensor, *, is_training: bool) -> torch.Tensor:
+        """Flatten context, apply first linear layer, standardize, then tanh.
+
+        context_embeddings: [batch, CONTEXT_WINDOW, EMBEDDING_DIM] or [CONTEXT_WINDOW, EMBEDDING_DIM] with view used by caller.
+        Returns: [batch, HIDDEN_SIZE]
+        """
+        flattened_context = context_embeddings.view(-1, FLATTENED_CONTEXT_DIM)
+        hidden_pre_activation = flattened_context @ weights_input_to_hidden + bias_hidden
+        if is_training:
+            hidden_pre_activation = standardize_train(hidden_pre_activation, bngain, bnbias, bn_running_mean, bn_running_std)
+        else:
+            hidden_pre_activation = standardize_eval(hidden_pre_activation, bngain, bnbias, bn_running_mean, bn_running_std)
+        return torch.tanh(hidden_pre_activation)
+
+    def compute_logits_from_embeddings(context_embeddings: torch.Tensor, *, is_training: bool) -> torch.Tensor:
+        """Convenience: embeddings -> hidden -> logits."""
+        hidden_activations = compute_hidden_activations(context_embeddings, is_training=is_training)
+        return hidden_activations @ weights_hidden_to_output + bias_output
+    
+    # First layer: transform from flattened context to hidden representation
+    # We use fan_in scaling with a tanh-specific gain (5/3). This mirrors common
+    # init schemes (LeCun/He/Xavier variants) to keep the variance of pre-activations
+    # approximately stable and avoid tanh saturation at init.
+    #   std ≈ gain / sqrt(fan_in), where gain for tanh ≈ 5/3
+    weights_input_to_hidden = (
+        torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator)
+        * (5/3)
+        / (FLATTENED_CONTEXT_DIM ** 0.5)
+    )
+    bias_hidden = torch.randn(HIDDEN_SIZE, generator=random_generator) * 0.01  # tiny initial offset
     
 
     
-    # Second layer: transform from hidden representation (100D) to output logits (vocab_size)
+    # Second layer: transform from hidden representation to output logits (vocab_size)
     # One output per character in the vocabulary
     #
     # Small output weights/biases help start the model "uncertain": logits near zero
     # produce near-uniform softmax, which yields healthier, less peaky gradients for cross-entropy.
     # If logits are too large initially, the model can be overconfident and harder to optimize.
-    W2 = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator) * 0.01  # small weights → modest logits, better early gradients
-    b2 = torch.randn(vocab_size, generator=random_generator) * 0  # zero bias keeps initial class preferences neutral
+    weights_hidden_to_output = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator) * 0.01  # small weights → modest logits, better early gradients
+    bias_output = torch.randn(vocab_size, generator=random_generator) * 0  # zero bias keeps initial class preferences neutral
+
+
+
+    bngain = torch.ones((1,HIDDEN_SIZE))
+    bnbias = torch.zeros((1,HIDDEN_SIZE))
+    # Running statistics for BN-style standardization (not learned by gradients)
+    bn_running_mean = torch.zeros((1, HIDDEN_SIZE))
+    bn_running_std = torch.ones((1, HIDDEN_SIZE))
     
 
     # Collect all trainable tensors. We will learn the embedding table and both layers.
-    parameters = [embedding_table, W1, b1, W2, b2]
+    parameters = [embedding_table, weights_input_to_hidden, bias_hidden, weights_hidden_to_output, bias_output, bngain, bnbias]
     # Print total number of trainable parameters for quick sanity check
     print(sum(p.nelement() for p in parameters))
 
@@ -163,15 +209,8 @@ def main() -> None:
         # Resulting shape is [num_examples, context_window, embedding_dim]
         context_embeddings = embedding_table[X_training[ix]]
 
-
-        # Apply the first linear transformation followed by tanh activation
-        # Shape: [num_examples, 6] @ [6, 100] + [100] = [num_examples, 100]
-        hidden_activations = torch.tanh(context_embeddings.view(-1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
-
-
-        # Compute the final logits (unnormalized scores for each character)
-        # Shapes: [batch, 100] @ [100, vocab_size] + [vocab_size] -> [batch, vocab_size]
-        logits = hidden_activations @ W2 + b2
+        # Forward: embeddings -> hidden -> logits
+        logits = compute_logits_from_embeddings(context_embeddings, is_training=True)
         
         # Cross-entropy loss compares predicted logits vs true next-character targets
         loss = F.cross_entropy(logits, Y_training[ix])
@@ -192,8 +231,7 @@ def main() -> None:
     # Validation: run a forward pass on the validation split to estimate generalization
 
     context_embeddings = embedding_table[X_validation]
-    hidden_activations = torch.tanh(context_embeddings.view(-1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
-    logits = hidden_activations @ W2 + b2
+    logits = compute_logits_from_embeddings(context_embeddings, is_training=False)
     loss = F.cross_entropy(logits, Y_validation)
 
     print(loss.item())  # lower is better; use this to compare different runs/settings
@@ -205,8 +243,7 @@ def main() -> None:
             generated_indices = []
             while True:
                 context_embeddings = embedding_table[torch.tensor(context)]  # [CONTEXT_WINDOW, EMBEDDING_DIM]
-                hidden_activations = torch.tanh(context_embeddings.view(1, FLATTENED_CONTEXT_DIM) @ W1 + b1)
-                logits = hidden_activations @ W2 + b2  # [1, vocab_size]
+                logits = compute_logits_from_embeddings(context_embeddings.view(1, CONTEXT_WINDOW, EMBEDDING_DIM), is_training=False)  # [1, vocab_size]
                 probs = F.softmax(logits, dim=1)  # convert logits to probabilities
                 ix = torch.multinomial(probs, num_samples=1, generator=random_generator).item()  # sample next char index
                 if ix == START_TOKEN_INDEX:
