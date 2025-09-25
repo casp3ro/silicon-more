@@ -4,16 +4,16 @@ import random
 import matplotlib.pyplot as plt
 
 # -----------------------------
-# Constants
+# Configuration / hyperparameters
 # -----------------------------
 PY_RANDOM_SEED = 42
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.9
 
-START_END_TOKEN = '.'
-START_TOKEN_INDEX = 0
+START_END_TOKEN = '.'  # token used to mark both start and end of a name
+START_TOKEN_INDEX = 0  # index reserved for START_END_TOKEN
 
-TORCH_RANDOM_SEED = 2147483647
+TORCH_RANDOM_SEED = 2147483647  # fixed seed for reproducible torch RNG
 
 EMBEDDING_DIM = 10
 CONTEXT_WINDOW = 3
@@ -27,6 +27,8 @@ LEARNING_RATE = 0.04
 SAMPLE_ONE_HOT_INDEX = 5
 
 # Derived dimensions
+# After embedding each of the CONTEXT_WINDOW characters with EMBEDDING_DIM features,
+# we concatenate them, resulting in this flattened feature dimension.
 FLATTENED_CONTEXT_DIM = CONTEXT_WINDOW * EMBEDDING_DIM
 
 def main() -> None:
@@ -97,8 +99,7 @@ def main() -> None:
     
     # Create a random number generator with a fixed seed for reproducible results.
     # This ensures that every time we run the script, we get the same random weights
-    # and can compare results across different runs. The seed value (2147483647) is
-    # a large prime number that provides good randomness distribution.
+    # and can compare results across different runs.
     random_generator = torch.Generator().manual_seed(TORCH_RANDOM_SEED)
 
     # print("Training tensor shapes -> X: %s, Y: %s" % (tuple(X.shape), tuple(Y.shape)))
@@ -125,6 +126,8 @@ def main() -> None:
         """Batch standardization for training; updates running stats in-place.
 
         x: [batch, features]; running_mean/std: [1, features].
+        Uses population-style variance (unbiased=False). If your batches are tiny or
+        nearly-constant, consider adding a small epsilon to batch_std for stability.
         """
         batch_mean = x.mean(0, keepdim=True)
         batch_std = x.std(0, keepdim=True, unbiased=False) 
@@ -141,7 +144,9 @@ def main() -> None:
     def compute_hidden_activations(context_embeddings: torch.Tensor, *, is_training: bool) -> torch.Tensor:
         """Flatten context, apply first linear layer, standardize, then tanh.
 
-        context_embeddings: [batch, CONTEXT_WINDOW, EMBEDDING_DIM] or [CONTEXT_WINDOW, EMBEDDING_DIM] with view used by caller.
+        context_embeddings can be either:
+          - [batch, CONTEXT_WINDOW, EMBEDDING_DIM]
+          - [CONTEXT_WINDOW, EMBEDDING_DIM] (caller may view to add a batch dim)
         Returns: [batch, HIDDEN_SIZE]
         """
         flattened_context = context_embeddings.view(-1, FLATTENED_CONTEXT_DIM)
@@ -157,11 +162,11 @@ def main() -> None:
         hidden_activations = compute_hidden_activations(context_embeddings, is_training=is_training)
         return hidden_activations @ weights_hidden_to_output + bias_output
     
-    # First layer: transform from flattened context to hidden representation
-    # We use fan_in scaling with a tanh-specific gain (5/3). This mirrors common
-    # init schemes (LeCun/He/Xavier variants) to keep the variance of pre-activations
-    # approximately stable and avoid tanh saturation at init.
-    #   std ≈ gain / sqrt(fan_in), where gain for tanh ≈ 5/3
+    # First layer: transform from flattened context to hidden representation.
+    # Initialization uses fan_in scaling with a tanh-specific gain (~5/3), akin to
+    # common schemes (LeCun/He/Xavier variants) to keep pre-activation variance moderate
+    # and avoid tanh saturation at initialization.
+    #   std ≈ gain / sqrt(fan_in)
     weights_input_to_hidden = (
         torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator)
         * (5/3)
@@ -171,25 +176,24 @@ def main() -> None:
     
 
     
-    # Second layer: transform from hidden representation to output logits (vocab_size)
-    # One output per character in the vocabulary
-    #
-    # Small output weights/biases help start the model "uncertain": logits near zero
-    # produce near-uniform softmax, which yields healthier, less peaky gradients for cross-entropy.
-    # If logits are too large initially, the model can be overconfident and harder to optimize.
+    # Second layer: transform from hidden representation to output logits (vocab_size).
+    # One output per character in the vocabulary. Small output weights keep initial logits
+    # modest, yielding smoother gradients early in training.
     weights_hidden_to_output = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator) * 0.01  # small weights → modest logits, better early gradients
     bias_output = torch.randn(vocab_size, generator=random_generator) * 0  # zero bias keeps initial class preferences neutral
 
 
 
-    bngain = torch.ones((1,HIDDEN_SIZE))
-    bnbias = torch.zeros((1,HIDDEN_SIZE))
-    # Running statistics for BN-style standardization (not learned by gradients)
+    bngain = torch.ones((1,HIDDEN_SIZE))   # learnable per-feature scale for normalization
+    bnbias = torch.zeros((1,HIDDEN_SIZE))  # learnable per-feature shift for normalization
+    # Running statistics for BN-style standardization (not learned by gradients):
+    # used during validation and generation where batch statistics are unreliable.
     bn_running_mean = torch.zeros((1, HIDDEN_SIZE))
     bn_running_std = torch.ones((1, HIDDEN_SIZE))
     
 
-    # Collect all trainable tensors. We will learn the embedding table and both layers.
+    # Collect all trainable tensors. We will learn the embedding table, both layers,
+    # and the normalization scale/shift (bngain/bnbias). Running stats are not trained via gradients.
     parameters = [embedding_table, weights_input_to_hidden, bias_hidden, weights_hidden_to_output, bias_output, bngain, bnbias]
     # Print total number of trainable parameters for quick sanity check
     print(sum(p.nelement() for p in parameters))
@@ -204,12 +208,10 @@ def main() -> None:
         # Sample a minibatch of 32 random training examples
         ix = torch.randint(0, X_training.shape[0], (BATCH_SIZE,))
 
-        # The idiomatic way: directly index into the embedding table with X.
-        # This yields one 2D vector per character in the 3-long context window.
-        # Resulting shape is [num_examples, context_window, embedding_dim]
+        # Embedding lookup for the current minibatch -> [batch, CONTEXT_WINDOW, EMBEDDING_DIM]
         context_embeddings = embedding_table[X_training[ix]]
 
-        # Forward: embeddings -> hidden -> logits
+        # Forward: embeddings -> hidden -> logits (training mode uses batch stats)
         logits = compute_logits_from_embeddings(context_embeddings, is_training=True)
         
         # Cross-entropy loss compares predicted logits vs true next-character targets
@@ -228,7 +230,8 @@ def main() -> None:
             p.data += -learning_rate * p.grad
     
 
-    # Validation: run a forward pass on the validation split to estimate generalization
+    # Validation: run a forward pass on the validation split to estimate generalization.
+    # We use running statistics (eval mode normalization) for stability.
 
     context_embeddings = embedding_table[X_validation]
     logits = compute_logits_from_embeddings(context_embeddings, is_training=False)
@@ -237,7 +240,7 @@ def main() -> None:
     print(loss.item())  # lower is better; use this to compare different runs/settings
 
 
-    # Generate a few names
+    # Generate a few names using the trained model (eval mode normalization).
     for _ in range(10):
             context = [START_TOKEN_INDEX] * CONTEXT_WINDOW
             generated_indices = []
