@@ -1,248 +1,316 @@
-import random  # for dataset shuffling and sampling seeds
-import torch  # main tensor library (like NumPy on GPU/CPU)
-import torch.nn.functional as F  # neural network loss functions and utilities
+"""
+Character-level MLP for name generation following industry best practices.
 
-# -----------------------------
-# Configuration / hyperparameters
-# -----------------------------
-PY_RANDOM_SEED = 42  # controls Python's pseudo-random operations (e.g., shuffling)
-TRAIN_RATIO = 0.8  # 80% of names for training
-VAL_RATIO = 0.9    # next 10% for validation; remainder 10% for test
+This module implements a character-level language model using PyTorch.
+"""
 
-START_END_TOKEN = '.'  # special token to mark both start and end of a name
-START_TOKEN_INDEX = 0  # numeric index reserved for the special token
+import logging
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-TORCH_RANDOM_SEED = 2147483647  # fixed seed for reproducible torch RNG
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split
 
-EMBEDDING_DIM = 10      # size of each character's vector representation
-CONTEXT_WINDOW = 3      # how many previous characters to condition on
-HIDDEN_SIZE = 200       # number of neurons in the hidden layer
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-TRAIN_STEPS = 20000     # total parameter update steps
-BATCH_SIZE = 32         # how many examples per minibatch
-LEARNING_RATE = 0.04    # not used directly (we use step LR like makemore)
+@dataclass
+class ModelConfig:
+    """Configuration for the CharacterMLP model."""
+    # Model architecture
+    embedding_dim: int = 10
+    context_window: int = 3
+    hidden_size: int = 200
+    vocab_size: Optional[int] = None  # Will be set based on data
+    
+    # Training hyperparameters
+    train_steps: int = 20000
+    batch_size: int = 32
+    learning_rate: float = 0.1
+    min_learning_rate: float = 0.01
+    
+    # Data splits
+    train_ratio: float = 0.8
+    val_ratio: float = 0.9
+    
+    # Special tokens
+    start_end_token: str = '.'
+    start_token_index: int = 0
+    
+    # Reproducibility
+    random_seed: int = 42
+    torch_seed: int = 2147483647
+    
+    # Logging
+    log_interval: int = 1000
 
-# For the optional one-hot demo
-SAMPLE_ONE_HOT_INDEX = 5
 
-# Derived dimensions
-# After embedding each of the CONTEXT_WINDOW characters with EMBEDDING_DIM features,
-# we concatenate them, resulting in this flattened feature dimension.
-FLATTENED_CONTEXT_DIM = CONTEXT_WINDOW * EMBEDDING_DIM  # features after concat
-EPSILON = 1e-5  # small constant to avoid divide-by-zero in normalization
+class CharacterDataset(Dataset):
+    """Dataset class for character-level language modeling."""
+    
+    def __init__(self, words: List[str], vocab: Dict[str, int], context_window: int):
+        self.vocab = vocab
+        self.context_window = context_window
+        self.data = self._build_dataset(words)
+    
+    def _build_dataset(self, words: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build (context, next_char) pairs using sliding window."""
+        inputs, targets = [], []
+        
+        for word in words:
+            # Initialize context with start tokens
+            context = [self.vocab['.']] * self.context_window
+            
+            # Add start token and process each character
+            for char in word + '.':
+                next_idx = self.vocab[char]
+                inputs.append(context.copy())
+                targets.append(next_idx)
+                # Slide window
+                context = context[1:] + [next_idx]
+        
+        return torch.tensor(inputs), torch.tensor(targets)
+    
+    def __len__(self) -> int:
+        return len(self.data[0])
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.data[0][idx], self.data[1][idx]
+
+
+class CharacterMLP(nn.Module):
+    """Character-level MLP for name generation using PyTorch built-in modules."""
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Embedding layer: maps character indices to dense vectors
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim)
+        
+        # Linear layers with proper initialization
+        flattened_dim = config.context_window * config.embedding_dim
+        self.fc1 = nn.Linear(flattened_dim, config.hidden_size, bias=False)
+        self.ln1 = nn.LayerNorm(config.hidden_size)
+        self.fc2 = nn.Linear(config.hidden_size, config.vocab_size)
+        
+        # Initialize weights using Xavier/Glorot initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using PyTorch best practices."""
+        # Xavier initialization for fc1 (similar to original scaling)
+        nn.init.xavier_normal_(self.fc1.weight, gain=5/3)
+        
+        # Small random initialization for fc2 (similar to original)
+        nn.init.normal_(self.fc2.weight, std=0.01)
+        nn.init.zeros_(self.fc2.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the network.
+        
+        Args:
+            x: Input tensor of shape [batch_size, context_window] containing character indices
+            
+        Returns:
+            Logits tensor of shape [batch_size, vocab_size]
+        """
+        # Embedding lookup: [batch_size, context_window] -> [batch_size, context_window, embedding_dim]
+        embedded = self.embedding(x)
+        
+        # Flatten context dimension: [batch_size, context_window, embedding_dim] -> [batch_size, context_window * embedding_dim]
+        flattened = embedded.view(embedded.size(0), -1)
+        
+        # First linear layer + LayerNorm + tanh
+        hidden = torch.tanh(self.ln1(self.fc1(flattened)))
+        
+        # Output layer
+        logits = self.fc2(hidden)
+        
+        return logits
+    
+    def get_num_parameters(self) -> int:
+        """Return total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class Vocabulary:
+    """Vocabulary management for character-level modeling."""
+    
+    def __init__(self, words: List[str], start_end_token: str = '.'):
+        self.start_end_token = start_end_token
+        self.char_to_idx, self.idx_to_char = self._build_vocab(words)
+        self.vocab_size = len(self.char_to_idx)
+    
+    def _build_vocab(self, words: List[str]) -> Tuple[Dict[str, int], Dict[int, str]]:
+        """Build character vocabulary from words."""
+        # Get unique characters
+        chars = sorted(set(''.join(words)))
+        chars = [self.start_end_token] + chars  # Add special token first
+        
+        # Create mappings
+        char_to_idx = {char: idx for idx, char in enumerate(chars)}
+        idx_to_char = {idx: char for char, idx in char_to_idx.items()}
+        
+        return char_to_idx, idx_to_char
+    
+    def encode(self, text: str) -> List[int]:
+        """Encode text to indices."""
+        return [self.char_to_idx[char] for char in text]
+    
+    def decode(self, indices: List[int]) -> str:
+        """Decode indices to text."""
+        return ''.join(self.idx_to_char[idx] for idx in indices)
+
+
+def load_data(file_path: str) -> List[str]:
+    """Load names from file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        logger.error(f"Data file not found: {file_path}")
+        raise
+
+
+def setup_reproducibility(config: ModelConfig):
+    """Setup random seeds for reproducibility."""
+    random.seed(config.random_seed)
+    torch.manual_seed(config.torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.torch_seed)
+        torch.cuda.manual_seed_all(config.torch_seed)
+
 
 def main() -> None:
-    """Train a tiny character-level MLP on names and sample a few outputs.
-
-    High-level flow:
-    1) Read names and build a character vocabulary (plus special '.')
-    2) Turn names into (context, next_char) training pairs
-    3) Define parameters: embeddings C, linear layers W1/W2 (+ b2)
-    4) Use simple batch norm before the tanh nonlinearity
-    5) Train with SGD and step learning-rate schedule
-    6) Validate and sample new names from the model
-    """
-    # Load the raw dataset (one name per line)
-    with open("names.txt", "r") as file:  # one name per line
-        words_dataset = file.read().splitlines()
-
-    # Build one vocabulary across the entire dataset so indices are consistent
-    characters = sorted(list(set(''.join(words_dataset))))  # unique characters
-    characters = [START_END_TOKEN] + characters  # Add start/end token at the beginning
-    stoi = {symbol: idx for idx, symbol in enumerate(characters)}  # char -> index
-    itos = {idx: symbol for idx, symbol in enumerate(characters)}  # index -> char
-
-    def build_dataset(words: list, stoi_map: dict, context_window: int = CONTEXT_WINDOW):
-        """Build (context, next_char) pairs using a fixed sliding window."""
-        inputs, targets = [], []  # will hold many (context, next_char_index)
-        for word in words:
-            # initialize sliding window context with start tokens '.'
-            context = [START_TOKEN_INDEX] * context_window
-            for character in word + '.':
-                next_index = stoi_map[character]
-                inputs.append(context)
-                targets.append(next_index)
-                # slide the window: drop oldest, append new index
-                context = context[1:] + [next_index]
-        # tensors of integer indices
-        X = torch.tensor(inputs)  # shape [num_samples, context_window]
-        Y = torch.tensor(targets) # shape [num_samples]
-        return X, Y
-
-
-    random.seed(PY_RANDOM_SEED)  # reproducible Python-level randomness
-    random.shuffle(words_dataset)  # shuffle dataset so splits are representative
-
-    # Compute split indices for train/val/test partitions
-    n1 = int(TRAIN_RATIO * len(words_dataset))
-    n2 = int(VAL_RATIO * len(words_dataset))
-
-    training_words = words_dataset[:n1]
-    validation_words = words_dataset[n1:n2]
-    test_words = words_dataset[n2:]
-
-    # turn splits into supervised learning pairs
-    X_training, Y_training = build_dataset(training_words, stoi)
-    X_validation, Y_validation = build_dataset(validation_words, stoi)
-    X_test, Y_test = build_dataset(test_words, stoi)
-
-
+    """Main training function following industry best practices."""
+    # Configuration
+    config = ModelConfig()
     
-    # torch RNG for reproducible parameter init and sampling
-    random_generator = torch.Generator().manual_seed(TORCH_RANDOM_SEED)
-
-    # print("Training tensor shapes -> X: %s, Y: %s" % (tuple(X.shape), tuple(Y.shape)))
-
-    vocab_size = len(characters)
-    # Embedding table C: maps character indices -> EMBEDDING_DIM vectors
-    C = torch.randn((vocab_size, EMBEDDING_DIM), generator=random_generator)
-
-    # simple one-hot lookup demo (not used further, for intuition)
-    _ = F.one_hot(torch.tensor(SAMPLE_ONE_HOT_INDEX), num_classes=vocab_size).float() @ C
-
-    class BatchNorm1dSimple:
-        """Minimal 1D BatchNorm: normalize per feature using batch stats at train,
-        and running stats at eval. Has learnable gain/bias like PyTorch's BatchNorm."""
-        def __init__(self, dim: int, eps: float = EPSILON, momentum: float = 0.001) -> None:
-            self.eps = eps
-            self.momentum = momentum
-            self.gain = torch.ones((1, dim))
-            self.bias = torch.zeros((1, dim))
-            self.running_mean = torch.zeros((1, dim))
-            self.running_std = torch.ones((1, dim))
-
-        def __call__(self, x: torch.Tensor, *, is_training: bool) -> torch.Tensor:
-            if is_training:
-                batch_mean = x.mean(0, keepdim=True)
-                batch_std = x.std(0, keepdim=True, unbiased=False).clamp_min(self.eps)
-                # update running statistics
-                self.running_mean.mul_(1.0 - self.momentum).add_(self.momentum * batch_mean)
-                self.running_std.mul_(1.0 - self.momentum).add_(self.momentum * batch_std)
-                xhat = (x - batch_mean) / batch_std
-            else:
-                xhat = (x - self.running_mean) / self.running_std.clamp_min(self.eps)
-            return self.gain * xhat + self.bias
-
-    def compute_hidden_activations(context_embeddings: torch.Tensor, *, is_training: bool) -> torch.Tensor:
-        """Embedding -> concat -> Linear(W1) -> BatchNorm -> tanh.
-
-        Accepts tensors shaped either [batch, CONTEXT_WINDOW, EMBEDDING_DIM]
-        or [CONTEXT_WINDOW, EMBEDDING_DIM] (we'll add batch dim when sampling).
-        Returns hidden activations of shape [batch, HIDDEN_SIZE].
-        """
-        # collapse the context dimension into features for a single Linear layer
-        flattened_context = context_embeddings.view(-1, FLATTENED_CONTEXT_DIM)
-        hidden_pre_activation = flattened_context @ W1  # Linear layer (no bias)
-        hidden_norm = bn(hidden_pre_activation, is_training=is_training)  # BatchNorm
-        return torch.tanh(hidden_norm)  # non-linearity
-
-    def compute_logits_from_embeddings(context_embeddings: torch.Tensor, *, is_training: bool) -> torch.Tensor:
-        """Convenience wrapper: embeddings -> hidden -> logits over next char."""
-        hidden_activations = compute_hidden_activations(context_embeddings, is_training=is_training)
-        return hidden_activations @ W2 + b2
+    # Setup reproducibility
+    setup_reproducibility(config)
     
-    # Layer 1
-    W1 = (
-        torch.randn((FLATTENED_CONTEXT_DIM, HIDDEN_SIZE), generator=random_generator)
-        * (5/3)
-        / (FLATTENED_CONTEXT_DIM ** 0.5)
+    # Load data
+    logger.info("Loading data...")
+    words = load_data("names.txt")
+    logger.info(f"Loaded {len(words)} names")
+    
+    # Build vocabulary
+    vocab = Vocabulary(words, config.start_end_token)
+    config.vocab_size = vocab.vocab_size
+    logger.info(f"Vocabulary size: {vocab.vocab_size}")
+    
+    # Create datasets
+    dataset = CharacterDataset(words, vocab.char_to_idx, config.context_window)
+    
+    # Split data
+    train_size = int(config.train_ratio * len(dataset))
+    val_size = int((config.val_ratio - config.train_ratio) * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(config.random_seed)
     )
-    # Note: We omit a bias here because BatchNorm will re-center/shift
     
-    # Layer 2
-    W2 = torch.randn((HIDDEN_SIZE, vocab_size), generator=random_generator) * 0.01  # small init -> gentler logits
-    b2 = torch.randn(vocab_size, generator=random_generator) * 0  # start with neutral class bias
-
-
-
-    bn = BatchNorm1dSimple(HIDDEN_SIZE, eps=EPSILON, momentum=0.001)  # BN before tanh
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
     
-
-    parameters = [C, W1, W2, b2, bn.gain, bn.bias]  # trainable tensors
-    print(sum(p.nelement() for p in parameters))  # quick parameter count sanity check
-
-    # Enable gradient tracking for manual optimization below
-    for p in parameters:
-        p.requires_grad = True  # tell PyTorch to track gradients for SGD
-
-    # -----------------------------
-    # Training
-    # -----------------------------
-    for step in range(TRAIN_STEPS):  # main optimization loop
-        # sample a random minibatch of indices
-        ix = torch.randint(0, X_training.shape[0], (BATCH_SIZE,))
-
-        # embedding lookup: integer indices -> vectors, shape [B, CONTEXT_WINDOW, EMBEDDING_DIM]
-        context_embeddings = C[X_training[ix]]
-
-        # forward pass through the network (training mode uses batch BN stats)
-        logits = compute_logits_from_embeddings(context_embeddings, is_training=True)
+    # Create model
+    model = CharacterMLP(config)
+    logger.info(f"Model created with {model.get_num_parameters()} parameters")
+    
+    # Setup device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.info(f"Using device: {device}")
+    model.to(device)
+    
+    # Setup optimizer and scheduler
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.train_steps, eta_min=config.min_learning_rate
+    )
+    
+    # Training loop
+    logger.info("Starting training...")
+    model.train()
+    step = 0
+    
+    while step < config.train_steps:
+        for batch_x, batch_y in train_loader:
+            if step >= config.train_steps:
+                break
+                
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            
+            # Forward pass
+            logits = model(batch_x)
+            loss = F.cross_entropy(logits, batch_y)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            step += 1
+            
+            # Logging
+            if step % config.log_interval == 0 or step == 1:
+                current_lr = optimizer.param_groups[0]['lr']
+                logger.info(f"Step {step}/{config.train_steps}: "
+                          f"Loss={loss.item():.4f}, LR={current_lr:.6f}")
+    
+    # Final evaluation
+    logger.info("Training completed!")
+    model.eval()
+    with torch.no_grad():
+        val_losses = []
+        for batch_x, batch_y in val_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            logits = model(batch_x)
+            val_loss = F.cross_entropy(logits, batch_y)
+            val_losses.append(val_loss.item())
         
-        # cross-entropy compares predicted logits with correct next-char indices
-        loss = F.cross_entropy(logits, Y_training[ix])
-
-        # zero out any stale gradients from the previous iteration
-        for p in parameters:
-            p.grad = None
-
-        # compute fresh gradients via backprop
-        loss.backward()
-
-        # SGD parameter update with simple step learning-rate schedule (makemore style)
-        learning_rate = 0.1 if step < (TRAIN_STEPS // 2) else 0.01
-        for p in parameters:
-            p.data += -learning_rate * p.grad
-        # periodic logging to monitor training progress
-        if (step + 1) % 10000 == 0 or step == 0:
-            with torch.no_grad():
-                print(f"{step+1:7d}/{TRAIN_STEPS:7d}: {loss.item():.4f}")
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        logger.info(f"Final validation loss: {avg_val_loss:.4f}")
     
-
-    # Validation under no-grad with running statistics
-    # -----------------------------
-    # Validation
-    # -----------------------------
-    with torch.no_grad():  # no gradients needed for evaluation
-        context_embeddings = C[X_validation]
-        logits = compute_logits_from_embeddings(context_embeddings, is_training=False)
-        val_loss = F.cross_entropy(logits, Y_validation)
-    print(val_loss.item())  # lower is better; use to tune hyperparameters
-
-
-    # -----------------------------
-    # Sampling
-    # -----------------------------
-    def sample_name() -> str:
-        """Stochastic decoding loop: sample one character at a time until '.'"""
-        with torch.no_grad():
-            # start with an all-start-token context of length CONTEXT_WINDOW
-            context = [START_TOKEN_INDEX] * CONTEXT_WINDOW
+    # Generate sample names
+    logger.info("Generating sample names...")
+    model.eval()
+    with torch.no_grad():
+        for i in range(10):
+            # Start with context of start tokens
+            context = [vocab.char_to_idx['.']] * config.context_window
             generated_indices = []
-            while True:
-                # single example forward pass: shape to [1, CONTEXT_WINDOW, EMBEDDING_DIM]
-                context_embeddings = C[torch.tensor(context)]
-                logits = compute_logits_from_embeddings(
-                    context_embeddings.view(1, CONTEXT_WINDOW, EMBEDDING_DIM),
-                    is_training=False,
-                )
-                # convert logits to probabilities over the vocabulary
+            
+            for _ in range(20):  # max length
+                # Convert to tensor
+                context_tensor = torch.tensor(context).unsqueeze(0).to(device)
+                
+                # Forward pass
+                logits = model(context_tensor)
                 probs = F.softmax(logits, dim=1).squeeze(0)
-                # sample the next character index from the distribution
-                next_index = torch.multinomial(probs, num_samples=1, generator=random_generator).item()
-                # '.' ends the name
-                if next_index == START_TOKEN_INDEX:
+                
+                # Sample next character
+                next_idx = torch.multinomial(probs, 1).item()
+                
+                # Stop if we hit the end token
+                if next_idx == vocab.char_to_idx['.']:
                     break
-                generated_indices.append(next_index)
-                # slide the window to include the newest character
-                context = context[1:] + [next_index]
-        # turn indices back into a string
-        return ''.join(itos[i] for i in generated_indices)
-
-    for _ in range(10):
-        print(sample_name())
-
-
-
+                
+                generated_indices.append(next_idx)
+                context = context[1:] + [next_idx]
+            
+            name = vocab.decode(generated_indices)
+            logger.info(f"  {i+1:2d}. {name}")
 
 
 if __name__ == "__main__":
