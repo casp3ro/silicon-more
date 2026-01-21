@@ -1,8 +1,16 @@
 ## PyTorch for Beginners — Quickstart and Core Methods
 
-This guide is for beginners who want to learn AI/ML using PyTorch. It explains the most important concepts and APIs in simple terms, with short examples you can try.
+This guide is for **beginners who want to understand the pieces used inside `mlp.py`**.  
+It explains the most important concepts and APIs in simple terms, with short examples you can try.
 
-If you want to go deeper later, refer to the official docs: [PyTorch documentation](https://docs.pytorch.org/docs/stable/index.html).
+You do **not** need to read this to simply run the project, but it is helpful if you are curious about:
+
+- What is a **tensor**?
+- What is a **loss**?
+- What does **`optimizer.step()`** actually do?
+
+If you want to go deeper later, refer to the official docs:  
+[PyTorch documentation](https://docs.pytorch.org/docs/stable/index.html).
 
 ---
 
